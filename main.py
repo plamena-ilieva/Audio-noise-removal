@@ -1,31 +1,62 @@
-
+import os
+import json
+import torch
 import torchaudio
 import torchaudio.transforms as T
-import torch
-import librosa
-import numpy as np
-import whisper
-from demucs import pretrained
-from demucs.apply import apply_model
-from jiwer import wer
-import os
-import speechbrain as sb
-import noisereduce as nr
-# import speechbrain as sb
-# from speechbrain.inference.separation import SepformerSeparation
-import torch
 from torchaudio.functional import highpass_biquad, lowpass_biquad
 
+import whisper
+from jiwer import wer
+import noisereduce as nr
+from demucs import pretrained
+from demucs.apply import apply_model
 
-# 1. Зареждане на данни (пример с Common Voice)
+
+##############################################################################
+# 1. Зареждане/запис на вече съществуващи транскрипции (в JSON)
+##############################################################################
+def load_transcriptions_json(json_path):
+    """
+    Опитва се да прочете JSON файл със структура:
+      {
+        "име-на-файл.wav": "транскрипция..."
+        ...
+      }
+    Ако файлът не съществува, връща празен речник.
+    """
+    if not os.path.exists(json_path):
+        return {}
+    try:
+        with open(json_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        return data
+    except Exception as e:
+        print(f"[WARNING] Неуспешно четене на {json_path}: {e}")
+        return {}
+
+def save_transcriptions_json(transcriptions_dict, json_path):
+    """
+    Записва речника transcriptions_dict в JSON файл, с utf-8 и отстъп.
+    """
+    try:
+        with open(json_path, 'w', encoding='utf-8') as f:
+            json.dump(transcriptions_dict, f, ensure_ascii=False, indent=2)
+        print(f"[INFO] Записани транскрипции в {json_path}")
+    except Exception as e:
+        print(f"[ERROR] Неуспешен запис на транскрипции: {e}")
+
+
+##############################################################################
+# 2. Основни функции за зареждане, транскрипция, добавяне на шум, денойз
+##############################################################################
 def load_clean_audio(file_path, target_sr=16000):
     waveform, sr = torchaudio.load(file_path)
-    transform = T.Resample(orig_freq=sr, new_freq=target_sr)
-    waveform = transform(waveform)
-    return waveform, target_sr
+    if sr != target_sr:
+        transform = T.Resample(orig_freq=sr, new_freq=target_sr)
+        waveform = transform(waveform)
+        sr = target_sr
+    return waveform, sr
 
-
-# 2. Добавяне на шум към речта (подравняване на дължините)
 def add_noise(clean_waveform, noise_waveform, snr_db=10):
     clean_len = clean_waveform.shape[1]
     noise_len = noise_waveform.shape[1]
@@ -40,43 +71,35 @@ def add_noise(clean_waveform, noise_waveform, snr_db=10):
     clean_rms = torch.sqrt(torch.mean(clean_waveform ** 2))
     desired_noise_rms = clean_rms / (10 ** (snr_db / 20))
     noise_waveform = noise_waveform * (desired_noise_rms / noise_rms)
+
     return clean_waveform + noise_waveform
 
+# Зареждаме HTDemucs (ако ще го ползваме)
+demucs_model = pretrained.get_model(name='htdemucs')
 
-# 3. Премахване на шум с Demucs
-model = pretrained.get_model(name='htdemucs')
-
-# Зареждане на предварително обучен модел за премахване на шум
-# separator = SepformerSeparation.from_hparams(source="speechbrain/sepformer-whamr-v1", savedir="models")
-
-# Функция за премахване на шум с Noisereduce
-# Bandpass filter to focus on speech frequencies (300–3400 Hz)
 def bandpass_filter(waveform, sr, low_freq=300, high_freq=3400):
     waveform = highpass_biquad(waveform, sr, low_freq)
     waveform = lowpass_biquad(waveform, sr, high_freq)
     return waveform
 
-
-# Split audio into smaller segments for better noise reduction
-def segment_audio(audio, segment_length=16000):  # 1 second at 16kHz
+def segment_audio(audio, segment_length=16000):
     num_segments = audio.size(1) // segment_length
     segments = torch.split(audio, segment_length, dim=1)
     if audio.size(1) % segment_length != 0:
         segments = list(segments) + [audio[:, num_segments * segment_length:]]
     return segments
 
-
 def adaptive_noise_profile(segment):
-    # Identify low-energy parts of the segment as noise
-    noise_estimation = segment[segment.abs() < (0.05 * torch.max(segment.abs()))]
+    # Оценка на шума въз основа на нискоенергийни части
+    threshold = 0.05 * torch.max(segment.abs())
+    noise_estimation = segment[segment.abs() < threshold]
     if len(noise_estimation) == 0:
-        # Fallback: Use the first 100 ms as noise
-        noise_estimation = segment[:, :segment.size(1) // 10]
+        # fallback: първите 100 ms
+        tenth = max(1, segment.size(1) // 10)
+        noise_estimation = segment[:, :tenth]
     return noise_estimation
 
-
 def reduce_noise_segment_adaptive(segment, sr):
-    # Estimate adaptive noise profile
     noise_profile = adaptive_noise_profile(segment).numpy()
     segment_np = segment.numpy()
     denoised_segment = nr.reduce_noise(
@@ -89,175 +112,133 @@ def reduce_noise_segment_adaptive(segment, sr):
     )
     return torch.tensor(denoised_segment).float()
 
-
-# Apply Noisereduce with advanced parameters and noise profile
-def reduce_noise_segment(segment, sr, noise_profile=None):
-    segment_np = segment.numpy()
-    if noise_profile is not None:
-        noise_profile = noise_profile.numpy()
-    denoised_segment = nr.reduce_noise(
-        y=segment_np,
-        sr=sr,
-        y_noise=noise_profile,
-        n_fft=1024,  # Higher frequency resolution
-        hop_length=256,  # Overlap between frames
-        stationary=False  # Non-stationary noise handling
-    )
-    return torch.tensor(denoised_segment).float()
-
-
-# Full pipeline for denoising audio
 def denoise_audio_with_noisereduce(noisy_waveform, sr=16000):
-    # Step 1: Bandpass filter to focus on speech frequencies
-    filtered_waveform = bandpass_filter(noisy_waveform, sr)
+    filtered = bandpass_filter(noisy_waveform, sr)
+    segments = segment_audio(filtered)
+    denoised_segments = [reduce_noise_segment_adaptive(seg, sr) for seg in segments]
+    return torch.cat(denoised_segments, dim=1)
 
-    # Step 2: Extract noise profile (first second or external noise sample)
-    noise_profile = filtered_waveform[:, :sr]  # First second of the audio
-
-    # Step 3: Split the waveform into smaller segments
-    segments = segment_audio(filtered_waveform)
-
-    # Step 4: Apply noise reduction to each segment
-    denoised_segments = [
-        reduce_noise_segment_adaptive(segment, sr) for segment in segments
-    ]
-
-    # Step 5: Reconstruct the full waveform
-    denoised_waveform = torch.cat(denoised_segments, dim=1)
-
-    return denoised_waveform
-
-
-# Промяна на функцията `denoise_audio` да използва Noisereduce
 def denoise_audio_nr(noisy_waveform, orig_sr=16000):
-    denoised_speech = denoise_audio_with_noisereduce(noisy_waveform, orig_sr)
-    return denoised_speech
-
-
-# Останалата част от кода остава същата
-
+    return denoise_audio_with_noisereduce(noisy_waveform, orig_sr)
 
 def denoise_audio_demucs(noisy_waveform, orig_sr=16000):
-    # Resample to 44.1 kHz, which Demucs requires
     resample_to_44k = T.Resample(orig_freq=orig_sr, new_freq=44100)
     resample_to_orig = T.Resample(orig_freq=44100, new_freq=orig_sr)
 
-    noisy_waveform_44k = resample_to_44k(noisy_waveform)
+    waveform_44k = resample_to_44k(noisy_waveform)
+    waveform_44k = waveform_44k.unsqueeze(0)
 
-    # Demucs expects waveform as a 3D tensor (batch, channels, samples)
-    noisy_waveform_44k = noisy_waveform_44k.unsqueeze(0)
+    sources = apply_model(demucs_model, waveform_44k)
 
-    # Apply the Demucs model
-    sources = apply_model(model, noisy_waveform_44k)
-
-    # Extract clean speech (assumes first source is speech)
+    # Примерно speech обикновено е [0][0] или [0][1] в зависимост от модела
     clean_speech_44k = sources[0][1]
 
-    # Resample back to the original sampling rate
     clean_speech = resample_to_orig(clean_speech_44k.unsqueeze(0)).squeeze(0)
     return clean_speech
 
 
-# 4. Транскрипция с Whisper
-whisper_model = whisper.load_model("medium")
+##############################################################################
+# 3. Модели за транскрипция (Whisper)
+##############################################################################
+whisper_model_medium = whisper.load_model("medium")
 whisper_model_large = whisper.load_model("large")
 
+def transcribe_audio(waveform, sr=16000, model_type="medium", language='bg', temp_file="temp.wav"):
+    """
+    Транскрибира в зависимост от зададения model_type ("medium" или "large").
+    """
+    if model_type == "medium":
+        w_model = whisper_model_medium
+    elif model_type == "large":
+        w_model = whisper_model_large
+    else:
+        raise ValueError("Unknown model type")
 
-def transcribe_audio(waveform, sr=16000):
-    temp_file = "temp.wav"
     torchaudio.save(temp_file, waveform, sr)
-    result = whisper_model.transcribe(temp_file, language='bg')
+    result = w_model.transcribe(temp_file, language=language)
     os.remove(temp_file)
     return result["text"]
 
-
-def transcribe_audio_large(waveform, sr=16000):
-    temp_file = "temp.wav"
-    torchaudio.save(temp_file, waveform, sr)
-    result = whisper_model_large.transcribe(temp_file, language='bg')
-    os.remove(temp_file)
-    return result["text"]
-
-# 5. Изчисляване на WER
-def evaluate_denoising(clean_text, noisy_text, denoised_text):
-    wer_noisy = wer(clean_text, noisy_text)
-    wer_denoised = wer(clean_text, denoised_text)
+def evaluate_denoising(ref_text, noisy_text, denoised_text):
+    wer_noisy = wer(ref_text, noisy_text)
+    wer_denoised = wer(ref_text, denoised_text)
     return wer_noisy, wer_denoised
 
 
-# 6. Основна функция
-def main(clean_audio_folder, noise_audio_path):
+##############################################################################
+# 4. Основна функция:
+#    - Чете/попълва JSON с "чисти" транскрипции
+#    - Добавя шум, денойзва, сравнява
+##############################################################################
+def main(
+    clean_audio_folder="clean_audio",
+    noise_audio_path="white-noise.mp3",
+    transcriptions_json="clean_transcriptions.json"
+):
+    # 4.1 Зареждаме речника с вече известни транскрипции
+    clean_transcriptions = load_transcriptions_json(transcriptions_json)
+    print(f"[INFO] Заредени {len(clean_transcriptions)} транскрипции от {transcriptions_json}")
+
+    # 4.2 Транскрибиране на нови файлове (ако не фигурират в речника)
+    file_list = os.listdir(clean_audio_folder)
+    for file_name in file_list:
+        if file_name not in clean_transcriptions:
+            file_path = os.path.join(clean_audio_folder, file_name)
+            # Зареждаме аудиото
+            clean_audio, sr = load_clean_audio(file_path)
+            # Транскрибираме, примерно с 'large'
+            text = transcribe_audio(clean_audio, sr, model_type="large", language="bg", temp_file="temp_clean.wav")
+            clean_transcriptions[file_name] = text
+            print(f"[INFO] Нов файл '{file_name}' => транскрибиран.")
+
+    # 4.3 Записваме обновения речник обратно
+    save_transcriptions_json(clean_transcriptions, transcriptions_json)
+
+    # 4.4 Зареждаме аудио за шум (еднократно)
     noise_audio, _ = load_clean_audio(noise_audio_path)
-    denoised = 0
-    noisy = 0
-    for file_name in os.listdir(clean_audio_folder):
+
+    # 4.5 Сравнение - за всеки файл добавяме шум, денойзваме, смятаме WER
+    count_better_denoised = 0
+    count_better_noisy = 0
+
+    for file_name in file_list:
+        # Ако няма транскрипция (примерно файлът не е аудио), пропускаме
+        if file_name not in clean_transcriptions:
+            continue
+
+        ref_text = clean_transcriptions[file_name]
         file_path = os.path.join(clean_audio_folder, file_name)
         clean_audio, sr = load_clean_audio(file_path)
 
-        noisy_audio = add_noise(clean_audio, noise_audio)
+        # Добавяме шум
+        noisy_audio = add_noise(clean_audio, noise_audio, snr_db=10)
+        # Денойзваме (noisereduce или demucs)
         denoised_audio = denoise_audio_nr(noisy_audio, orig_sr=sr)
-        torchaudio.save("noise_" + file_name, noisy_audio, 16000)
-        torchaudio.save("denoised_" + file_name, denoised_audio, 16000)
+        # denoised_audio = denoise_audio_demucs(noisy_audio, orig_sr=sr)
 
-        clean_text = transcribe_audio_large(clean_audio, sr)
-        print(clean_text)
-        noisy_text = transcribe_audio(noisy_audio, sr)
-        print(noisy_text)
-        denoised_text = transcribe_audio(denoised_audio, sr)
-        print(denoised_text)
+        # Транскрибиране (примерно с "medium")
+        noisy_text = transcribe_audio(noisy_audio, sr, model_type="medium", language="bg", temp_file="temp_noisy.wav")
+        denoised_text = transcribe_audio(denoised_audio, sr, model_type="medium", language="bg", temp_file="temp_denoised.wav")
 
-        wer_noisy, wer_denoised = evaluate_denoising(clean_text, noisy_text, denoised_text)
+        # WER сравнение
+        wer_noisy, wer_denoised = evaluate_denoising(ref_text, noisy_text, denoised_text)
 
-        print(f"Файл: {file_name}")
-        print(f"WER на шумен запис: {wer_noisy}")
-        print(f"WER след изчистване: {wer_denoised}")
+        print(f"\n[Файл: {file_name}]")
+        print(f"  * Чиста транскрипция: {ref_text}")
+        print(f"  * Noisy  транскрипция: {noisy_text}")
+        print(f"  * Denoised транскрипция: {denoised_text}")
+        print(f"  * WER(Noisy) = {wer_noisy:.3f}")
+        print(f"  * WER(Denoised) = {wer_denoised:.3f}")
 
         if wer_noisy > wer_denoised:
-            denoised += 1
+            count_better_denoised += 1
         else:
-            noisy += 1
+            count_better_noisy += 1
 
-    print(f"шумен запис: {noisy}")
-    print(f"след изчистване: {denoised}")
+    print("\n=== Обобщение ===")
+    print(f"Брой случаи, в които денойзнатото има по-нисък WER: {count_better_denoised}")
+    print(f"Брой случаи, в които шумното има по-нисък или равен WER: {count_better_noisy}")
 
 
 if __name__ == "__main__":
-    clean_audio_folder = "clean_audio"
-    noise_audio_path = "white-noise.mp3"
-    main(clean_audio_folder, noise_audio_path)
-
-'''
-from pydub import AudioSegment
-from pydub.utils import make_chunks
-import os
-
-def split_audio(file_path, output_dir, chunk_length_ms=10000):
-    """
-    Splits an audio file into chunks of specified length.
-
-    :param file_path: Path to the input audio file
-    :param output_dir: Directory to save the chunks
-    :param chunk_length_ms: Length of each chunk in milliseconds (default 10 seconds)
-    """
-    # Load the audio file
-    audio = AudioSegment.from_file(file_path)
-
-    # Ensure output directory exists
-    os.makedirs(output_dir, exist_ok=True)
-
-    # Split audio into chunks
-    chunks = make_chunks(audio, chunk_length_ms)
-
-    # Export each chunk
-    for i, chunk in enumerate(chunks):
-        chunk_name = os.path.join(output_dir, f"chunk_{i+1}.wav")
-        chunk.export(chunk_name, format="wav")
-        print(f"Exported {chunk_name}")
-
-# Example usage
-if __name__ == "__main__":
-    input_file = "BNR-news-2025-01-22-12-00.mp3"  # Replace with your audio file path
-    output_directory = "output_chunks"  # Replace with your desired output directory
-
-    split_audio(input_file, output_directory)
-'''
+    main()
